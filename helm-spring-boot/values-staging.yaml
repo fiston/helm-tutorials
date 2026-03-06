@@ -1,0 +1,40 @@
+# values-staging.yaml
+replicaCount: 1
+
+image:
+  tag: ""  # set by CI
+
+spring:
+  profile: staging
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+keda:
+  enabled: false                  # no autoscaling in staging
+
+ingress:
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: letsencrypt-staging   # use staging issuer — avoid LE rate limits
+  hosts:
+    - host: finbridge-staging.bk.rw
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: finbridge-staging-tls
+      hosts:
+        - finbridge-staging.bk.rw
+
+probes:
+  liveness:
+    initialDelaySeconds: 90
+  readiness:
+    initialDelaySeconds: 45

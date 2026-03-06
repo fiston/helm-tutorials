@@ -1,0 +1,139 @@
+replicaCount: 2
+
+image:
+  repository: registry.gitlab.com/bk/finbridge-service
+  pullPolicy: IfNotPresent
+  tag: ""  # overridden by CI with GitVersion SemVer
+
+imagePullSecrets:
+  - name: gitlab-registry-secret
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/path: "/actuator/prometheus"
+  prometheus.io/port: "8080"
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false   # Spring Boot writes temp files
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: traefik              # K3S default ingress controller
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+  hosts:
+    - host: finbridge.bk.rw
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: finbridge-tls
+      hosts:
+        - finbridge.bk.rw
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+# Spring Boot JVM tuning for virtual threads + containers
+jvm:
+  opts: >-
+    -XX:+UseZGC
+    -XX:+ZGenerational
+    -XX:MaxRAMPercentage=75.0
+    -Djdk.virtualThreadScheduler.parallelism=4
+    -XX:+HeapDumpOnOutOfMemoryError
+    -XX:HeapDumpPath=/tmp/heap.hprof
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# Liveness/readiness via Spring Boot Actuator
+probes:
+  liveness:
+    path: /actuator/health/liveness
+    initialDelaySeconds: 60
+    periodSeconds: 15
+    failureThreshold: 3
+  readiness:
+    path: /actuator/health/readiness
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    failureThreshold: 3
+
+# Spring profiles and env
+spring:
+  profile: production
+  configServerUrl: ""           # set if using Spring Cloud Config
+
+# Externalized env vars (non-secret)
+env:
+  APP_ENV: production
+  SERVER_PORT: "8080"
+  # Add more as needed
+
+# Secret refs — create the K8s secret separately
+secrets:
+  enabled: true
+  secretName: finbridge-service-secrets
+  # Keys in the secret will be mounted as env vars:
+  # DB_URL, DB_USERNAME, DB_PASSWORD, JWT_SECRET, etc.
+
+persistence:
+  enabled: false
+  storageClass: local-path     # K3S default storage class
+  size: 1Gi
+  mountPath: /data
+
+postgresql:
+  enabled: false               # set true to deploy a sidecar PG for dev/staging
+  auth:
+    username: finbridge
+    database: finbridge_db
+    existingSecret: finbridge-pg-secret
+
+nodeSelector: {}
+tolerations: []
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - finbridge-service
+          topologyKey: kubernetes.io/hostname

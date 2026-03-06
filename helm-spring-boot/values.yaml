@@ -1,0 +1,147 @@
+replicaCount: 2
+
+image:
+  repository: registry.gitlab.com/bk/finbridge-service
+  pullPolicy: IfNotPresent
+  tag: ""  # overridden by CI with GitVersion SemVer
+
+imagePullSecrets:
+  - name: gitlab-registry-secret
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/path: "/actuator/prometheus"
+  prometheus.io/port: "8080"
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+# ClusterIP — NGINX Ingress handles external traffic via MetalLB
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: nginx                 # NGINX Ingress 4.11.3
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    cert-manager.io/cluster-issuer: letsencrypt-prod   # cert-manager v1.16.3
+  hosts:
+    - host: finbridge.bk.rw
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: finbridge-tls    # cert-manager will populate this secret
+      hosts:
+        - finbridge.bk.rw
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+# Spring Boot JVM tuning for virtual threads + containers
+jvm:
+  opts: >-
+    -XX:+UseZGC
+    -XX:+ZGenerational
+    -XX:MaxRAMPercentage=75.0
+    -Djdk.virtualThreadScheduler.parallelism=4
+    -XX:+HeapDumpOnOutOfMemoryError
+    -XX:HeapDumpPath=/tmp/heap.hprof
+
+# KEDA autoscaling 2.16.0 — replaces plain HPA
+keda:
+  enabled: false
+  minReplicaCount: 2
+  maxReplicaCount: 5
+  pollingInterval: 30
+  cooldownPeriod: 300
+  triggers:
+    - type: cpu
+      metricType: Utilization
+      metadata:
+        value: "70"
+    - type: memory
+      metricType: Utilization
+      metadata:
+        value: "80"
+
+# Liveness/readiness via Spring Boot Actuator
+probes:
+  liveness:
+    path: /actuator/health/liveness
+    initialDelaySeconds: 60
+    periodSeconds: 15
+    failureThreshold: 3
+  readiness:
+    path: /actuator/health/readiness
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    failureThreshold: 3
+
+spring:
+  profile: production
+  configServerUrl: ""
+
+env:
+  APP_ENV: production
+  SERVER_PORT: "8080"
+
+secrets:
+  enabled: true
+  secretName: finbridge-service-secrets
+
+persistence:
+  enabled: false
+  storageClass: local-path         # K3S default storage class
+  size: 1Gi
+  mountPath: /data
+
+nodeSelector: {}
+tolerations: []
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - finbridge-service
+          topologyKey: kubernetes.io/hostname
+
+# cert-manager ClusterIssuer bootstrap
+# Set installIssuer: true only on the FIRST deploy of the first service in the cluster
+certManager:
+  installIssuer: false
+  email: devops@bk.rw

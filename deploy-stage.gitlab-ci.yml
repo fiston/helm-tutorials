@@ -1,0 +1,65 @@
+# Add to your .gitlab-ci.yml — replace the deploy stage
+
+.deploy-template: &deploy-template
+  image:
+    name: alpine/helm:3.17.0
+    entrypoint: [""]
+  before_script:
+    - helm version
+    # Configure kubectl to talk to your K3S cluster
+    - mkdir -p ~/.kube
+    - echo "$KUBECONFIG_B64" | base64 -d > ~/.kube/config
+    - chmod 600 ~/.kube/config
+
+deploy-staging:
+  <<: *deploy-template
+  stage: deploy
+  environment:
+    name: staging
+    url: https://finbridge-staging.bk.rw
+  needs:
+    - job: build
+      artifacts: true
+    - job: calculate-version
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+  script:
+    - |
+      helm upgrade --install finbridge-service ./helm/finbridge-service \
+        --namespace finbridge-staging \
+        --create-namespace \
+        --values ./helm/finbridge-service/values.yaml \
+        --values ./helm/finbridge-service/values-staging.yaml \
+        --set image.tag=$SEMVER \
+        --set image.repository=$CI_REGISTRY_IMAGE \
+        --atomic \
+        --timeout 5m \
+        --wait
+
+deploy-production:
+  <<: *deploy-template
+  stage: deploy
+  environment:
+    name: production
+    url: https://finbridge.bk.rw
+  needs:
+    - job: build
+      artifacts: true
+    - job: calculate-version
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual          # requires manual approval for production
+  script:
+    - |
+      helm upgrade --install finbridge-service ./helm/finbridge-service \
+        --namespace finbridge \
+        --create-namespace \
+        --values ./helm/finbridge-service/values.yaml \
+        --values ./helm/finbridge-service/values-production.yaml \
+        --set image.tag=$SEMVER \
+        --set image.repository=$CI_REGISTRY_IMAGE \
+        --atomic \
+        --timeout 5m \
+        --wait

@@ -1,0 +1,48 @@
+# values-production.yaml
+replicaCount: 2
+
+image:
+  tag: ""  # set by CI
+
+spring:
+  profile: production
+
+keda:
+  enabled: true
+  minReplicaCount: 2
+  maxReplicaCount: 6
+  pollingInterval: 30
+  cooldownPeriod: 300
+  triggers:
+    - type: cpu
+      metricType: Utilization
+      metadata:
+        value: "70"
+    - type: memory
+      metricType: Utilization
+      metadata:
+        value: "80"
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+ingress:
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: finbridge.bk.rw
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: finbridge-tls
+      hosts:
+        - finbridge.bk.rw

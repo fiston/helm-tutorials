@@ -1,0 +1,12 @@
+apiVersion: v2
+name: finbridge-service
+description: BK FinBridge Spring Boot Microservice
+type: application
+version: 1.0.0
+appVersion: "0.0.1"
+keywords:
+  - bk
+  - finbridge
+  - spring-boot
+maintainers:
+  - name: BK DevSecOps

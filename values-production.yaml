@@ -1,0 +1,34 @@
+# values-production.yaml
+replicaCount: 2
+
+image:
+  tag: ""  # set by CI
+
+spring:
+  profile: production
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+ingress:
+  hosts:
+    - host: finbridge.bk.rw
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: finbridge-tls
+      hosts:
+        - finbridge.bk.rw
