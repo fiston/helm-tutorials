@@ -1,7 +1,8 @@
 # Spring Boot → k3s Deployment via Shared Helm Chart Templates
 
-> Stack: Kotlin · Spring Boot · Docker · k3s · Helm · GitLab CI · Azure DevOps  
-> Pattern: one shared `helm-charts` repo consumed by N microservice repos
+> Stack: Kotlin · Spring Boot · Docker · k3s · Helm · GitLab CI · GitVersion  
+> Pattern: one shared `helm-charts` repo consumed by N microservice repos  
+> Versioning: GitVersion drives every image tag, Helm chart version, and `appVersion` automatically from git history
 
 ---
 
@@ -22,6 +23,94 @@ my-service-repo/           ← per-project
 
 ---
 
+## Part 0 — GitVersion Setup (Both Repos)
+
+GitVersion reads your git tags and branch names to produce a deterministic semantic version (`1.3.0`, `1.3.0-alpha.4`, `1.3.0-rc.1`, etc.) that flows into Docker image tags, Helm `appVersion`, and chart packaging — zero manual version bumping.
+
+### 0.1 How it works in this setup
+
+```
+git tag v1.2.0  →  main branch   →  GITVERSION_SEMVER = 1.2.1   (patch auto-increment)
+                   develop branch →  GITVERSION_SEMVER = 1.3.0-alpha.3
+                   feature/xyz    →  GITVERSION_SEMVER = 1.3.0-feature-xyz.1
+```
+
+Every CI job gets the version as environment variables via a `dotenv` artifact:
+
+```
+GITVERSION_SEMVER=1.3.0-alpha.3
+GITVERSION_MAJORMINORPATCH=1.3.0
+GITVERSION_FULLSEMVER=1.3.0-alpha.3
+GITVERSION_INFORMATIOALVERSION=1.3.0-alpha.3+Branch.develop.Sha.abc1234
+```
+
+### 0.2 `GitVersion.yml` — place this in the **root of both repos**
+
+```yaml
+# GitVersion.yml
+assembly-versioning-scheme: MajorMinorPatch
+assembly-file-versioning-scheme: MajorMinorPatch
+mode: Mainline
+tag-prefix: "v"
+
+branches:
+  main:
+    regex: ^main$
+    label: ""                    # no pre-release label → clean 1.2.3
+    increment: Patch
+    prevent-increment-of-merged-branch-version: true
+    track-merge-target: false
+
+  develop:
+    regex: ^develop$
+    label: "alpha"               # → 1.3.0-alpha.{commits}
+    increment: Minor
+    track-merge-target: true
+
+  release:
+    regex: ^release[/-]
+    label: "rc"                  # → 1.3.0-rc.{commits}
+    increment: Minor
+
+  feature:
+    regex: ^feature[/-]
+    label: "feature-{BranchName}"
+    increment: Minor
+
+  hotfix:
+    regex: ^hotfix[/-]
+    label: "hotfix"
+    increment: Patch
+
+ignore:
+  sha: []
+```
+
+### 0.3 Install GitVersion (macOS dev machine)
+
+```bash
+# Homebrew
+brew install gitversion
+
+# Or via .NET tool (if you already have dotnet)
+dotnet tool install --global GitVersion.Tool
+
+# Verify
+gitversion /version
+```
+
+### 0.4 Run locally to preview version
+
+```bash
+# Must be run inside a git repo with full history
+git fetch --tags
+gitversion /output json
+```
+
+> **Critical:** GitLab CI must clone with full git history — set `GIT_DEPTH: 0` in any job that runs GitVersion. Without this, GitVersion cannot walk the tag history and will fall back to `0.1.0`.
+
+---
+
 ## Part 1 — Create the Shared Helm Chart Template Repo
 
 ### 1.1 Scaffold the chart
@@ -37,6 +126,7 @@ This generates boilerplate. Clean it up and replace with the structure below.
 ```
 helm-charts/
 ├── README.md
+├── GitVersion.yml                 ← chart repo versioning
 └── charts/
     └── springboot-app/
         ├── Chart.yaml
@@ -61,8 +151,8 @@ apiVersion: v2
 name: springboot-app
 description: Generic Helm chart for Spring Boot microservices at BK
 type: application
-version: 0.1.0          # chart version — bump on breaking changes
-appVersion: "latest"    # overridden per-deploy by CI
+version: 0.0.0          # placeholder — overridden by GitVersion in CI via --set version
+appVersion: "0.0.0"     # placeholder — overridden per-deploy via --set appVersion
 ```
 
 ---
@@ -463,27 +553,67 @@ helm push dist/springboot-app-0.1.0.tgz \
 ```yaml
 # helm-charts/.gitlab-ci.yml
 stages:
+  - version
   - lint
   - package
   - publish
 
+variables:
+  GIT_DEPTH: 0                    # required — GitVersion needs full history
+  GIT_FETCH_EXTRA_FLAGS: --tags   # required — GitVersion needs all tags
+
+# ── Reusable template ─────────────────────────────────────────────────────────
+
+.gitversion-vars: &gitversion-vars
+  image: gittools/gitversion:6.0.0-alpine.3.18-7.0
+  before_script:
+    - gitversion /output buildserver /nofetch > gitversion.env
+    - source gitversion.env || export $(cat gitversion.env | xargs)
+    - echo "Chart version → $GITVERSION_SEMVER"
+
+# ── Version ───────────────────────────────────────────────────────────────────
+
+gitversion:
+  stage: version
+  image: gittools/gitversion:6.0.0-alpine.3.18-7.0
+  script:
+    - gitversion /output buildserver /nofetch | tee gitversion.env
+  artifacts:
+    reports:
+      dotenv: gitversion.env    # exports GITVERSION_* to all downstream jobs
+    expire_in: 1 hour
+
+# ── Lint ──────────────────────────────────────────────────────────────────────
+
 lint:
   stage: lint
   image: alpine/helm:3.14.0
+  needs: [gitversion]
   script:
+    - echo "Linting chart at version $GITVERSION_SEMVER"
     - helm lint charts/springboot-app
+
+# ── Package & Publish ─────────────────────────────────────────────────────────
 
 package-and-publish:
   stage: publish
   image: alpine/helm:3.14.0
+  needs: [gitversion, lint]
   only:
     - main
+    - develop
+    - /^release\/.*/
   script:
+    # Inject GitVersion into Chart.yaml before packaging
+    - |
+      sed -i "s/^version:.*/version: ${GITVERSION_SEMVER}/" charts/springboot-app/Chart.yaml
+      sed -i "s/^appVersion:.*/appVersion: \"${GITVERSION_SEMVER}\"/" charts/springboot-app/Chart.yaml
     - helm package charts/springboot-app --destination dist/
     - helm registry login registry.gitlab.bk.rw
         -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD
-    - helm push dist/springboot-app-*.tgz
+    - helm push dist/springboot-app-${GITVERSION_SEMVER}.tgz
         oci://registry.gitlab.bk.rw/devops/helm-charts
+    - echo "Published springboot-app:${GITVERSION_SEMVER}"
 ```
 
 ---
@@ -498,6 +628,7 @@ my-service/
 │   └── main/kotlin/...
 ├── helm/
 │   └── values.yaml          ← only project-specific overrides
+├── GitVersion.yml           ← same file as in helm-charts repo
 ├── Dockerfile
 ├── docker-compose.yml       ← local dev only
 ├── build.gradle.kts
@@ -515,7 +646,8 @@ my-service/
 
 image:
   repository: registry.gitlab.bk.rw/bk/my-service
-  # tag is injected by CI: --set image.tag=$CI_COMMIT_SHORT_SHA
+  # tag is injected by CI: --set image.tag=$GITVERSION_SEMVER
+  # e.g. 1.3.0 on main, 1.3.0-alpha.4 on develop
 
 replicaCount: 2
 
@@ -568,12 +700,20 @@ RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 USER appuser
 
 ARG JAR_FILE=build/libs/*.jar
+ARG APP_VERSION=0.0.0           # injected by CI: --build-arg APP_VERSION=$GITVERSION_SEMVER
 COPY ${JAR_FILE} app.jar
+
+# Embed version as OCI label (visible via `docker inspect`)
+LABEL org.opencontainers.image.version="${APP_VERSION}"
+LABEL org.opencontainers.image.source="https://gitlab.bk.rw/bk/my-service"
 
 # Virtual threads + container-aware JVM
 ENV JAVA_OPTS="-XX:+UseContainerSupport \
                -XX:MaxRAMPercentage=75.0 \
                -Djava.security.egd=file:/dev/./urandom"
+
+# Expose version to Spring Boot's /actuator/info
+ENV APP_VERSION=${APP_VERSION}
 
 EXPOSE 8080
 
@@ -591,7 +731,7 @@ dependencies {
 }
 ```
 
-`application.yml` — expose health endpoints:
+`application.yml` — expose health endpoints and version:
 
 ```yaml
 management:
@@ -609,6 +749,14 @@ management:
       enabled: true
     readinessState:
       enabled: true
+  info:
+    env:
+      enabled: true   # exposes info.* env vars at /actuator/info
+
+info:
+  app:
+    version: ${APP_VERSION:local}   # set via Dockerfile ENV APP_VERSION
+    name: my-service
 ```
 
 ---
@@ -619,21 +767,24 @@ management:
 
 ```bash
 # In any job that does `helm upgrade`
+# GITVERSION_SEMVER is available via dotenv artifact from the gitversion job
+
 helm registry login registry.gitlab.bk.rw \
   -u $CI_REGISTRY_USER \
   -p $CI_REGISTRY_PASSWORD
 
 helm upgrade --install my-service \
   oci://registry.gitlab.bk.rw/devops/helm-charts/springboot-app \
-  --version 0.1.0 \
+  --version $HELM_CHART_VERSION \            # chart version — pinned in variables
   --values helm/values.yaml \
-  --set image.tag=$CI_COMMIT_SHORT_SHA \
+  --set image.tag=$GITVERSION_SEMVER \       # ← from GitVersion dotenv artifact
+  --set appVersion=$GITVERSION_SEMVER \      # ← visible in helm history
   --namespace my-namespace \
   --create-namespace \
   --wait --timeout 5m
 ```
 
-> The `--version` pin keeps your service decoupled from chart updates. Bump deliberately.
+> Pin `HELM_CHART_VERSION` to a specific chart release (e.g. `1.2.0`). The service's own `GITVERSION_SEMVER` is independent of the chart version — they version different things.
 
 ---
 
@@ -645,6 +796,7 @@ helm upgrade --install my-service \
 # .gitlab-ci.yml — my-service
 
 stages:
+  - version
   - build
   - test
   - security
@@ -652,15 +804,17 @@ stages:
   - deploy
 
 variables:
+  GIT_DEPTH: 0                    # required — GitVersion needs full git history
+  GIT_FETCH_EXTRA_FLAGS: --tags   # required — GitVersion needs all tags
   GRADLE_OPTS: "-Dorg.gradle.daemon=false"
   IMAGE_NAME: registry.gitlab.bk.rw/bk/my-service
   HELM_CHART_REPO: oci://registry.gitlab.bk.rw/devops/helm-charts
   HELM_CHART_NAME: springboot-app
-  HELM_CHART_VERSION: "0.1.0"
+  HELM_CHART_VERSION: "1.0.0"     # pin to a published chart version
   K8S_NAMESPACE: my-service
   KUBECONFIG: /tmp/k3s-kubeconfig
 
-# ── Templates ─────────────────────────────────────────────────────────────────
+# ── Reusable templates ────────────────────────────────────────────────────────
 
 .gradle-cache: &gradle-cache
   cache:
@@ -675,15 +829,32 @@ variables:
         -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD
     - echo "$K3S_KUBECONFIG_B64" | base64 -d > $KUBECONFIG
     - export KUBECONFIG=$KUBECONFIG
+    - echo "Deploying image tag → $GITVERSION_SEMVER"
+
+# ── Version ───────────────────────────────────────────────────────────────────
+
+gitversion:
+  stage: version
+  image: gittools/gitversion:6.0.0-alpine.3.18-7.0
+  script:
+    # Output all GITVERSION_* vars into a dotenv file for downstream jobs
+    - gitversion /output buildserver /nofetch | tee gitversion.env
+    - echo "Resolved version → $(grep GITVERSION_SEMVER gitversion.env)"
+  artifacts:
+    reports:
+      dotenv: gitversion.env      # all downstream jobs get GITVERSION_* in env
+    expire_in: 1 hour
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 
 build:
   stage: build
   image: gradle:8.6-jdk21
+  needs: [gitversion]
   <<: *gradle-cache
   script:
-    - gradle clean build -x test
+    # Pass version to Gradle so it's baked into the JAR manifest
+    - gradle clean build -x test -Pversion=$GITVERSION_SEMVER
   artifacts:
     paths:
       - build/libs/*.jar
@@ -694,6 +865,7 @@ build:
 test:
   stage: test
   image: gradle:8.6-jdk21
+  needs: [gitversion, build]
   <<: *gradle-cache
   services:
     - name: postgres:15-alpine
@@ -717,6 +889,7 @@ test:
 
 trivy-scan:
   stage: security
+  needs: [gitversion]
   image:
     name: aquasec/trivy:latest
     entrypoint: [""]
@@ -734,10 +907,9 @@ trivy-scan:
 docker-build:
   stage: docker
   image: docker:24
+  needs: [gitversion, build, test]
   services:
     - docker:24-dind
-  dependencies:
-    - build
   before_script:
     - docker login registry.gitlab.bk.rw
         -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD
@@ -745,11 +917,13 @@ docker-build:
     - |
       docker build \
         --build-arg JAR_FILE=build/libs/*.jar \
-        -t $IMAGE_NAME:$CI_COMMIT_SHORT_SHA \
+        --build-arg APP_VERSION=$GITVERSION_SEMVER \
+        -t $IMAGE_NAME:$GITVERSION_SEMVER \
         -t $IMAGE_NAME:latest \
         .
-    - docker push $IMAGE_NAME:$CI_COMMIT_SHORT_SHA
+    - docker push $IMAGE_NAME:$GITVERSION_SEMVER
     - docker push $IMAGE_NAME:latest
+    - echo "Pushed $IMAGE_NAME:$GITVERSION_SEMVER"
   only:
     - main
     - develop
@@ -761,11 +935,10 @@ docker-scan:
   image:
     name: aquasec/trivy:latest
     entrypoint: [""]
-  dependencies:
-    - docker-build
+  needs: [gitversion, docker-build]
   script:
     - trivy image --exit-code 1 --severity CRITICAL
-        $IMAGE_NAME:$CI_COMMIT_SHORT_SHA
+        $IMAGE_NAME:$GITVERSION_SEMVER
   allow_failure: true
   only:
     - main
@@ -775,6 +948,7 @@ docker-scan:
 deploy-staging:
   stage: deploy
   image: alpine/helm:3.14.0
+  needs: [gitversion, docker-build]
   <<: *helm-setup
   script:
     - |
@@ -782,7 +956,8 @@ deploy-staging:
         $HELM_CHART_REPO/$HELM_CHART_NAME \
         --version $HELM_CHART_VERSION \
         --values helm/values.yaml \
-        --set image.tag=$CI_COMMIT_SHORT_SHA \
+        --set image.tag=$GITVERSION_SEMVER \
+        --set appVersion=$GITVERSION_SEMVER \
         --set app.profile=staging \
         --set ingress.host=my-service-staging.bk.rw \
         --namespace ${K8S_NAMESPACE}-staging \
@@ -799,6 +974,7 @@ deploy-staging:
 deploy-production:
   stage: deploy
   image: alpine/helm:3.14.0
+  needs: [gitversion, docker-build]
   <<: *helm-setup
   script:
     - |
@@ -806,14 +982,15 @@ deploy-production:
         $HELM_CHART_REPO/$HELM_CHART_NAME \
         --version $HELM_CHART_VERSION \
         --values helm/values.yaml \
-        --set image.tag=$CI_COMMIT_SHORT_SHA \
+        --set image.tag=$GITVERSION_SEMVER \
+        --set appVersion=$GITVERSION_SEMVER \
         --namespace $K8S_NAMESPACE \
         --create-namespace \
         --wait --timeout 5m
   environment:
     name: production
     url: https://my-service.bk.rw
-  when: manual          # ← requires a human click
+  when: manual          # ← requires a human click in GitLab UI
   only:
     - main
 ```
@@ -849,6 +1026,9 @@ In GitLab → **Settings → CI/CD → Variables**:
 | `K3S_KUBECONFIG_B64` | `<base64 content>` | ✅ | ✅ |
 | `CI_REGISTRY_USER` | GitLab username or token name | ✅ | ❌ |
 | `CI_REGISTRY_PASSWORD` | GitLab token (registry scope) | ✅ | ✅ |
+| `HELM_CHART_VERSION` | e.g. `1.0.0` — set at group level to share across services | ❌ | ❌ |
+
+> `HELM_CHART_VERSION` can be set at the **GitLab group level** so all service repos inherit it automatically. Update it there when you publish a new chart version.
 
 ### 6.3 Create the namespace and image pull secret on k3s
 
@@ -931,19 +1111,35 @@ Developer pushes to `develop`
     │
     ▼
 GitLab CI
-  [build]     gradle clean build
+  [version]   gitversion → resolves 1.3.0-alpha.4
+                → exports GITVERSION_SEMVER via dotenv artifact
+  [build]     gradle clean build -Pversion=1.3.0-alpha.4
   [test]      gradle test (Postgres service container)
   [security]  trivy fs scan
-  [docker]    build + push image → GitLab Registry
-  [docker-scan] trivy image scan
+  [docker]    docker build --build-arg APP_VERSION=1.3.0-alpha.4
+              → image tagged :1.3.0-alpha.4 + :latest
+              → pushed to GitLab Registry
+  [docker-scan] trivy image scan on :1.3.0-alpha.4
   [deploy]    helm upgrade --install
-                ← pulls chart from helm-charts OCI registry
-                ← uses helm/values.yaml from this repo
-                ← --set image.tag=$CI_COMMIT_SHORT_SHA
+                ← chart: oci://…/springboot-app:1.0.0  (HELM_CHART_VERSION pin)
+                ← --set image.tag=1.3.0-alpha.4
+                ← --set appVersion=1.3.0-alpha.4
                 → deploys to k3s staging namespace
     │
     ▼  (merge to main → manual trigger)
+  [version]   gitversion → resolves 1.3.0  (clean semver, no pre-release label)
+  [build/test/docker] ... same flow, tagged :1.3.0
   [deploy]    helm upgrade --install → k3s production namespace
+```
+
+### GitVersion tag workflow for releases
+
+```bash
+# On main after merge — tag to drive the next version
+git tag v1.3.0
+git push origin v1.3.0
+# → next build on main resolves GITVERSION_SEMVER = 1.3.0
+# → next commit after tag resolves to 1.3.1 (patch increment)
 ```
 
 ---
@@ -951,24 +1147,37 @@ GitLab CI
 ## Quick Cheatsheet
 
 ```bash
-# Add new project: 3 files needed
+# Add new project: 4 files needed
+#   GitVersion.yml            (copy from this guide — same for all services)
 #   Dockerfile
 #   helm/values.yaml          (override image, host, env, secrets)
 #   .gitlab-ci.yml            (copy template, change variables block)
 
-# Upgrade chart version across all services
-# → bump HELM_CHART_VERSION in each .gitlab-ci.yml
-# → or use a GitLab group-level variable HELM_CHART_VERSION
+# Preview GitVersion locally
+git fetch --tags
+gitversion /output json | jq '{semver: .SemVer, full: .FullSemVer, info: .InformationalVersion}'
+
+# Bump chart version for all services at once
+# → update HELM_CHART_VERSION in GitLab group-level CI/CD variables
 
 # Rollback
 helm rollback my-service 0 --namespace my-service   # 0 = previous release
 
-# Dry-run before deploy
+# Check what version is running
+helm history my-service --namespace my-service
+kubectl get deployment my-service -n my-service \
+  -o jsonpath='{.spec.template.spec.containers[0].image}'
+
+# Dry-run before deploy (use real GITVERSION_SEMVER value)
 helm upgrade --install my-service \
   oci://registry.gitlab.bk.rw/devops/helm-charts/springboot-app \
-  --version 0.1.0 \
+  --version 1.0.0 \
   --values helm/values.yaml \
-  --set image.tag=abc123 \
+  --set image.tag=1.3.0-alpha.4 \
+  --set appVersion=1.3.0-alpha.4 \
   --namespace my-service \
   --dry-run --debug
+
+# Create a release tag to drive clean semver on main
+git tag v1.3.0 && git push origin v1.3.0
 ```
