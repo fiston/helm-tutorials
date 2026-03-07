@@ -1,14 +1,15 @@
 # Spring Boot → k3s Deployment via Shared Helm Chart Templates
 
-> Stack: Kotlin · Spring Boot · Docker · k3s · Helm · GitLab CI · GitVersion  
+> Stack: Kotlin · Spring Boot · Docker · k3s · Helm · gitlab.com CI · GitVersion  
 > Pattern: one shared `helm-charts` repo consumed by N microservice repos  
-> Versioning: GitVersion drives every image tag, Helm chart version, and `appVersion` automatically from git history
+> Versioning: GitVersion drives every image tag, Helm chart version, and `appVersion` automatically from git history  
+> Registry: all built-in gitlab.com variables (`$CI_REGISTRY`, `$CI_REGISTRY_IMAGE`, `$CI_REGISTRY_USER`, `$CI_REGISTRY_PASSWORD`) — nothing to create manually
 
 ---
 
 ## Overview
 
-```
+```bash
 helm-charts-repo/          ← shared, versioned, reusable
   charts/
     springboot-app/        ← generic chart (one template fits all)
@@ -23,13 +24,28 @@ my-service-repo/           ← per-project
 
 ---
 
+## gitlab.com Built-in Registry Variables
+
+gitlab.com automatically injects these into **every pipeline job** — you never define them:
+
+| Variable                | Resolves to                                 |
+|-------------------------|---------------------------------------------|
+| `$CI_REGISTRY`          | `registry.gitlab.com`                       |
+| `$CI_REGISTRY_IMAGE`    | `registry.gitlab.com/<namespace>/<project>` |
+| `$CI_REGISTRY_USER`     | `gitlab-ci-token` (ephemeral per job)       |
+| `$CI_REGISTRY_PASSWORD` | Job token, rotated every pipeline           |
+
+Use these everywhere instead of hardcoding registry URLs. The only prerequisite: **Settings → CI/CD → Token Access → Job token scope** must allow the project to push to its own registry (enabled by default on gitlab.com).
+
+---
+
 ## Part 0 — GitVersion Setup (Both Repos)
 
 GitVersion reads your git tags and branch names to produce a deterministic semantic version (`1.3.0`, `1.3.0-alpha.4`, `1.3.0-rc.1`, etc.) that flows into Docker image tags, Helm `appVersion`, and chart packaging — zero manual version bumping.
 
 ### 0.1 How it works in this setup
 
-```
+```bash
 git tag v1.2.0  →  main branch   →  GITVERSION_SEMVER = 1.2.1   (patch auto-increment)
                    develop branch →  GITVERSION_SEMVER = 1.3.0-alpha.3
                    feature/xyz    →  GITVERSION_SEMVER = 1.3.0-feature-xyz.1
@@ -37,7 +53,7 @@ git tag v1.2.0  →  main branch   →  GITVERSION_SEMVER = 1.2.1   (patch auto-
 
 Every CI job gets the version as environment variables via a `dotenv` artifact:
 
-```
+```bash
 GITVERSION_SEMVER=1.3.0-alpha.3
 GITVERSION_MAJORMINORPATCH=1.3.0
 GITVERSION_FULLSEMVER=1.3.0-alpha.3
@@ -123,7 +139,7 @@ This generates boilerplate. Clean it up and replace with the structure below.
 
 ### 1.2 Final folder structure
 
-```
+```bash
 helm-charts/
 ├── README.md
 ├── GitVersion.yml                 ← chart repo versioning
@@ -514,8 +530,8 @@ spec:
 
 ### 2.1 Repo setup
 
-```
-gitlab.bk.rw/devops/helm-charts   (or GitHub, self-hosted Gitea, etc.)
+```bash
+gitlab.com/your-group/helm-charts
 ```
 
 Commit and push everything under `charts/springboot-app/`.
@@ -529,23 +545,24 @@ GitLab has a built-in Helm chart registry per project. Use it.
 helm package charts/springboot-app --destination dist/
 # Output: dist/springboot-app-0.1.0.tgz
 
-# Push to GitLab Helm registry
-helm plugin install https://github.com/chartmuseum/helm-push
-helm cm-push dist/springboot-app-0.1.0.tgz \
-  oci://registry.gitlab.bk.rw/devops/helm-charts \
-  --username $CI_REGISTRY_USER \
-  --password $CI_REGISTRY_PASSWORD
-```
-
-> Alternatively, use GitLab's OCI-native registry (Helm 3.8+):
-
-```bash
-helm registry login registry.gitlab.bk.rw \
+# Push to GitLab Helm registry (OCI-native, Helm 3.8+)
+helm registry login $CI_REGISTRY \
   -u $CI_REGISTRY_USER \
   -p $CI_REGISTRY_PASSWORD
 
 helm push dist/springboot-app-0.1.0.tgz \
-  oci://registry.gitlab.bk.rw/devops/helm-charts
+  oci://$CI_REGISTRY/$CI_PROJECT_PATH
+```
+
+> `$CI_PROJECT_PATH` resolves to `your-group/helm-charts` — no hardcoding needed.
+> Alternatively, use the `helm-push` plugin with ChartMuseum if you prefer HTTP-based repos:
+
+```bash
+helm plugin install https://github.com/chartmuseum/helm-push
+helm cm-push dist/springboot-app-0.1.0.tgz \
+  oci://$CI_REGISTRY/$CI_PROJECT_PATH \
+  --username $CI_REGISTRY_USER \
+  --password $CI_REGISTRY_PASSWORD
 ```
 
 ### 2.3 CI pipeline for the chart repo itself
@@ -561,6 +578,7 @@ stages:
 variables:
   GIT_DEPTH: 0                    # required — GitVersion needs full history
   GIT_FETCH_EXTRA_FLAGS: --tags   # required — GitVersion needs all tags
+  # $CI_REGISTRY, $CI_REGISTRY_USER, $CI_REGISTRY_PASSWORD are auto-injected by gitlab.com
 
 # ── Reusable template ─────────────────────────────────────────────────────────
 
@@ -609,11 +627,11 @@ package-and-publish:
       sed -i "s/^version:.*/version: ${GITVERSION_SEMVER}/" charts/springboot-app/Chart.yaml
       sed -i "s/^appVersion:.*/appVersion: \"${GITVERSION_SEMVER}\"/" charts/springboot-app/Chart.yaml
     - helm package charts/springboot-app --destination dist/
-    - helm registry login registry.gitlab.bk.rw
+    - helm registry login $CI_REGISTRY
         -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD
     - helm push dist/springboot-app-${GITVERSION_SEMVER}.tgz
-        oci://registry.gitlab.bk.rw/devops/helm-charts
-    - echo "Published springboot-app:${GITVERSION_SEMVER}"
+        oci://$CI_REGISTRY/$CI_PROJECT_PATH
+    - echo "Published springboot-app:${GITVERSION_SEMVER} → oci://$CI_REGISTRY/$CI_PROJECT_PATH"
 ```
 
 ---
@@ -622,7 +640,7 @@ package-and-publish:
 
 ### 3.1 New folder structure
 
-```
+```bash
 my-service/
 ├── src/
 │   └── main/kotlin/...
@@ -645,7 +663,7 @@ my-service/
 # ── Override only what's different from chart defaults ──
 
 image:
-  repository: registry.gitlab.bk.rw/bk/my-service
+  repository: $CI_REGISTRY_IMAGE   # auto-resolves to registry.gitlab.com/<namespace>/<project>
   # tag is injected by CI: --set image.tag=$GITVERSION_SEMVER
   # e.g. 1.3.0 on main, 1.3.0-alpha.4 on develop
 
@@ -705,7 +723,7 @@ COPY ${JAR_FILE} app.jar
 
 # Embed version as OCI label (visible via `docker inspect`)
 LABEL org.opencontainers.image.version="${APP_VERSION}"
-LABEL org.opencontainers.image.source="https://gitlab.bk.rw/bk/my-service"
+LABEL org.opencontainers.image.source="https://gitlab.com/${CI_PROJECT_PATH}"
 
 # Virtual threads + container-aware JVM
 ENV JAVA_OPTS="-XX:+UseContainerSupport \
@@ -767,17 +785,18 @@ info:
 
 ```bash
 # In any job that does `helm upgrade`
-# GITVERSION_SEMVER is available via dotenv artifact from the gitversion job
+# All $CI_REGISTRY_* and $GITVERSION_SEMVER are auto-injected — no manual setup needed
 
-helm registry login registry.gitlab.bk.rw \
+helm registry login $CI_REGISTRY \
   -u $CI_REGISTRY_USER \
   -p $CI_REGISTRY_PASSWORD
 
 helm upgrade --install my-service \
-  oci://registry.gitlab.bk.rw/devops/helm-charts/springboot-app \
+  oci://$CI_REGISTRY/your-group/helm-charts/springboot-app \
   --version $HELM_CHART_VERSION \            # chart version — pinned in variables
   --values helm/values.yaml \
   --set image.tag=$GITVERSION_SEMVER \       # ← from GitVersion dotenv artifact
+  --set image.repository=$CI_REGISTRY_IMAGE \# ← built-in, no hardcoding
   --set appVersion=$GITVERSION_SEMVER \      # ← visible in helm history
   --namespace my-namespace \
   --create-namespace \
@@ -807,8 +826,11 @@ variables:
   GIT_DEPTH: 0                    # required — GitVersion needs full git history
   GIT_FETCH_EXTRA_FLAGS: --tags   # required — GitVersion needs all tags
   GRADLE_OPTS: "-Dorg.gradle.daemon=false"
-  IMAGE_NAME: registry.gitlab.bk.rw/bk/my-service
-  HELM_CHART_REPO: oci://registry.gitlab.bk.rw/devops/helm-charts
+  # $CI_REGISTRY          → registry.gitlab.com              (auto-injected)
+  # $CI_REGISTRY_IMAGE    → registry.gitlab.com/<ns>/<proj>  (auto-injected)
+  # $CI_REGISTRY_USER     → gitlab-ci-token                  (auto-injected)
+  # $CI_REGISTRY_PASSWORD → ephemeral job token              (auto-injected)
+  HELM_CHART_REPO: oci://registry.gitlab.com/your-group/helm-charts
   HELM_CHART_NAME: springboot-app
   HELM_CHART_VERSION: "1.0.0"     # pin to a published chart version
   K8S_NAMESPACE: my-service
@@ -825,7 +847,7 @@ variables:
 
 .helm-setup: &helm-setup
   before_script:
-    - helm registry login registry.gitlab.bk.rw
+    - helm registry login $CI_REGISTRY
         -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD
     - echo "$K3S_KUBECONFIG_B64" | base64 -d > $KUBECONFIG
     - export KUBECONFIG=$KUBECONFIG
@@ -911,19 +933,19 @@ docker-build:
   services:
     - docker:24-dind
   before_script:
-    - docker login registry.gitlab.bk.rw
+    - docker login $CI_REGISTRY
         -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD
   script:
     - |
       docker build \
         --build-arg JAR_FILE=build/libs/*.jar \
         --build-arg APP_VERSION=$GITVERSION_SEMVER \
-        -t $IMAGE_NAME:$GITVERSION_SEMVER \
-        -t $IMAGE_NAME:latest \
+        -t $CI_REGISTRY_IMAGE:$GITVERSION_SEMVER \
+        -t $CI_REGISTRY_IMAGE:latest \
         .
-    - docker push $IMAGE_NAME:$GITVERSION_SEMVER
-    - docker push $IMAGE_NAME:latest
-    - echo "Pushed $IMAGE_NAME:$GITVERSION_SEMVER"
+    - docker push $CI_REGISTRY_IMAGE:$GITVERSION_SEMVER
+    - docker push $CI_REGISTRY_IMAGE:latest
+    - echo "Pushed $CI_REGISTRY_IMAGE:$GITVERSION_SEMVER"
   only:
     - main
     - develop
@@ -938,7 +960,7 @@ docker-scan:
   needs: [gitversion, docker-build]
   script:
     - trivy image --exit-code 1 --severity CRITICAL
-        $IMAGE_NAME:$GITVERSION_SEMVER
+        $CI_REGISTRY_IMAGE:$GITVERSION_SEMVER
   allow_failure: true
   only:
     - main
@@ -956,16 +978,17 @@ deploy-staging:
         $HELM_CHART_REPO/$HELM_CHART_NAME \
         --version $HELM_CHART_VERSION \
         --values helm/values.yaml \
+        --set image.repository=$CI_REGISTRY_IMAGE \
         --set image.tag=$GITVERSION_SEMVER \
         --set appVersion=$GITVERSION_SEMVER \
         --set app.profile=staging \
-        --set ingress.host=my-service-staging.bk.rw \
+        --set ingress.host=my-service-staging.example.com \
         --namespace ${K8S_NAMESPACE}-staging \
         --create-namespace \
         --wait --timeout 5m
   environment:
     name: staging
-    url: https://my-service-staging.bk.rw
+    url: https://my-service-staging.example.com
   only:
     - develop
 
@@ -982,6 +1005,7 @@ deploy-production:
         $HELM_CHART_REPO/$HELM_CHART_NAME \
         --version $HELM_CHART_VERSION \
         --values helm/values.yaml \
+        --set image.repository=$CI_REGISTRY_IMAGE \
         --set image.tag=$GITVERSION_SEMVER \
         --set appVersion=$GITVERSION_SEMVER \
         --namespace $K8S_NAMESPACE \
@@ -989,7 +1013,7 @@ deploy-production:
         --wait --timeout 5m
   environment:
     name: production
-    url: https://my-service.bk.rw
+    url: https://my-service.example.com
   when: manual          # ← requires a human click in GitLab UI
   only:
     - main
@@ -1021,14 +1045,13 @@ cat k3s.yaml | base64 | pbcopy   # copies to clipboard
 
 In GitLab → **Settings → CI/CD → Variables**:
 
-| Key | Value | Protected | Masked |
-|-----|-------|-----------|--------|
-| `K3S_KUBECONFIG_B64` | `<base64 content>` | ✅ | ✅ |
-| `CI_REGISTRY_USER` | GitLab username or token name | ✅ | ❌ |
-| `CI_REGISTRY_PASSWORD` | GitLab token (registry scope) | ✅ | ✅ |
-| `HELM_CHART_VERSION` | e.g. `1.0.0` — set at group level to share across services | ❌ | ❌ |
+| Key                   | Value              | Protected | Masked | Notes                                              |
+|-----------------------|--------------------|-----------|--------|----------------------------------------------------|
+| `K3S_KUBECONFIG_B64`  | `<base64 content>` | ✅        | ✅     | Must create — your k3s kubeconfig                  |
+| `HELM_CHART_VERSION`  | e.g. `1.0.0`       | ❌        | ❌     | Set at **group level** to share across all services|
 
-> `HELM_CHART_VERSION` can be set at the **GitLab group level** so all service repos inherit it automatically. Update it there when you publish a new chart version.
+> `$CI_REGISTRY`, `$CI_REGISTRY_USER`, `$CI_REGISTRY_PASSWORD`, and `$CI_REGISTRY_IMAGE` are **predefined by gitlab.com** — do not create them. They are automatically available in every job.
+> `HELM_CHART_VERSION` set at the **GitLab group level** means all service repos inherit it automatically. Bump it there once when you publish a new chart version.
 
 ### 6.3 Create the namespace and image pull secret on k3s
 
@@ -1036,8 +1059,11 @@ In GitLab → **Settings → CI/CD → Variables**:
 # Run once per service/namespace
 kubectl create namespace my-service
 
+# Use a GitLab Deploy Token (not your personal token) for the pull secret
+# Create one at: gitlab.com/your-group/helm-charts → Settings → Repository → Deploy tokens
+# Scope: read_registry
 kubectl create secret docker-registry gitlab-registry \
-  --docker-server=registry.gitlab.bk.rw \
+  --docker-server=registry.gitlab.com \
   --docker-username=<deploy-token-user> \
   --docker-password=<deploy-token-pass> \
   --namespace=my-service
@@ -1106,7 +1132,7 @@ volumes:
 
 ## Part 8 — End-to-End Flow Summary
 
-```
+```bash
 Developer pushes to `develop`
     │
     ▼
@@ -1168,11 +1194,16 @@ helm history my-service --namespace my-service
 kubectl get deployment my-service -n my-service \
   -o jsonpath='{.spec.template.spec.containers[0].image}'
 
-# Dry-run before deploy (use real GITVERSION_SEMVER value)
+# Dry-run before deploy
+# Replace YOUR_GROUP and use a real GITVERSION_SEMVER value
+helm registry login registry.gitlab.com \
+  -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD
+
 helm upgrade --install my-service \
-  oci://registry.gitlab.bk.rw/devops/helm-charts/springboot-app \
+  oci://registry.gitlab.com/your-group/helm-charts/springboot-app \
   --version 1.0.0 \
   --values helm/values.yaml \
+  --set image.repository=registry.gitlab.com/your-group/my-service \
   --set image.tag=1.3.0-alpha.4 \
   --set appVersion=1.3.0-alpha.4 \
   --namespace my-service \
